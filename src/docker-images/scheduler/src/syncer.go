@@ -70,7 +70,7 @@ func NewSyncer(podWorkerNum, nodeWorkerNum int32) *Syncer {
 		nodeLister:   nodeLister,
 		nodeQueue:    nodeQueue,
 
-		scheduler: NewScheduler(clientset, podLister, nodeLister),
+		scheduler: NewScheduler(NewK8sConnector(clientset, podLister, nodeLister)),
 	}
 
 	podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{

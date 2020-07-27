@@ -3,12 +3,8 @@ package main
 import (
 	"fmt"
 	"k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/client-go/kubernetes"
-	listerV1 "k8s.io/client-go/listers/core/v1"
 	"k8s.io/klog"
 	"strconv"
 	"strings"
@@ -29,15 +25,13 @@ func IsSelectorMatchs(labels, selector map[string]string) bool {
 }
 
 type Scheduler struct {
-	clientset *kubernetes.Clientset
+	connector Connector
 
-	nodesMu    sync.Mutex
-	nodes      map[string]*NodeInfo
-	nodeLister listerV1.NodeLister
+	nodesMu sync.Mutex
+	nodes   map[string]*NodeInfo
 
-	podsMu    sync.Mutex
-	pods      map[string]*PodInfo
-	podLister listerV1.PodLister
+	podsMu sync.Mutex
+	pods   map[string]*PodInfo
 }
 
 // Not concurrency safe object
@@ -222,14 +216,16 @@ func NewPodInfo(key string, pod *v1.Pod) *PodInfo {
 	jobId := "unknown"
 	ok := true
 
+	warningMsg := make([]string, 0)
+
 	if vcName, ok = pod.Labels["vcName"]; !ok {
-		klog.Warningf("unknown vc name for pod %s", key)
+		warningMsg = append(warningMsg, "unknown vc name")
 	}
 	if userName, ok = pod.Labels["userName"]; !ok {
-		klog.Warningf("unknown user name for pod %s", key)
+		warningMsg = append(warningMsg, "unknown user name")
 	}
 	if jobId, ok = pod.Labels["jobId"]; !ok {
-		klog.Warningf("unknown job id for pod %s", key)
+		warningMsg = append(warningMsg, "unknown job id")
 	}
 	preemptionAllowedS, ok := pod.Labels["preemptionAllowed"]
 	if !ok {
@@ -237,8 +233,11 @@ func NewPodInfo(key string, pod *v1.Pod) *PodInfo {
 	}
 	preemptionAllowed, err := strconv.ParseBool(preemptionAllowedS)
 	if err != nil {
-		klog.Warningf("failed to convert preemptionAllowed %s to bool, err %v",
-			preemptionAllowedS, err)
+		warningMsg = append(warningMsg, fmt.Sprintf("failed to convert preemptionAllowed %s to bool, err %v",
+			preemptionAllowedS, err))
+	}
+	if len(warningMsg) > 0 {
+		klog.Warningf("%s: %s", key, strings.Join(warningMsg, ", "))
 	}
 
 	info := &PodInfo{
@@ -290,18 +289,16 @@ func (p *PodInfo) String() string {
 	return fmt.Sprintf("%s(c:%d,g:%d)", p.Key, p.RequiredResource.Cpu, p.RequiredResource.Gpu)
 }
 
-func NewScheduler(clientset *kubernetes.Clientset, podLister listerV1.PodLister, nodeLister listerV1.NodeLister) *Scheduler {
+func NewScheduler(connector Connector) *Scheduler {
 	return &Scheduler{
-		clientset:  clientset,
-		nodes:      make(map[string]*NodeInfo),
-		nodeLister: nodeLister,
-		pods:       make(map[string]*PodInfo),
-		podLister:  podLister,
+		connector: connector,
+		nodes:     make(map[string]*NodeInfo),
+		pods:      make(map[string]*PodInfo),
 	}
 }
 
 func (s *Scheduler) fullSync() {
-	nodes, err := s.nodeLister.List(labels.Everything())
+	nodes, err := s.connector.GetAllNodes()
 	if err != nil {
 		panic(err.Error())
 	}
@@ -313,7 +310,7 @@ func (s *Scheduler) fullSync() {
 		}
 	}
 
-	pods, err := s.podLister.List(labels.Everything())
+	pods, err := s.connector.GetAllPods()
 	if err != nil {
 		panic(err.Error())
 	}
@@ -410,42 +407,11 @@ func (s *Scheduler) DeleteNode(name string) (returnedErr error) {
 }
 
 func (s *Scheduler) bindPodToNode(pod *PodInfo, node *NodeInfo) {
-	klog.Infof("bind pod %s to node %s", pod.String(), node.String())
-
-	s.clientset.CoreV1().Pods(pod.Namespace).Bind(&v1.Binding{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      pod.Name,
-			Namespace: pod.Namespace,
-		},
-		Target: v1.ObjectReference{
-			APIVersion: "v1",
-			Kind:       "Node",
-			Name:       node.Name,
-		},
-	})
+	s.connector.BindPodToNode(pod.Namespace, pod.Name, node.Name)
 
 	timestamp := time.Now().UTC()
 
-	s.clientset.CoreV1().Events(pod.Namespace).Create(&v1.Event{
-		Count:          1,
-		Message:        "Successfully scheduled",
-		Reason:         "Scheduled",
-		LastTimestamp:  metav1.NewTime(timestamp),
-		FirstTimestamp: metav1.NewTime(timestamp),
-		Type:           "Normal",
-		Source: v1.EventSource{
-			Component: SCHEDULER_NAME + " scheduler",
-		},
-		InvolvedObject: v1.ObjectReference{
-			Kind:      "Pod",
-			Name:      pod.Name,
-			Namespace: pod.Namespace,
-			UID:       pod.UID,
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			GenerateName: pod.Name + "-",
-		},
-	})
+	s.connector.CreatePodEvent(pod.Namespace, pod.Name, "Successfully scheduled", "Scheduled", pod.UID, timestamp)
 }
 
 func (s *Scheduler) scheduleFailed(pod *PodInfo, counter *SchedulerCounter) {
@@ -454,26 +420,7 @@ func (s *Scheduler) scheduleFailed(pod *PodInfo, counter *SchedulerCounter) {
 	message := fmt.Sprintf("Failed to schedule: %d resource not enough nodes, %d selector mismatch nodes, unschedulable %d",
 		counter.ResourceNotEnought, counter.SelectorNotMatch, counter.Unschedulable)
 
-	s.clientset.CoreV1().Events(pod.Namespace).Create(&v1.Event{
-		Count:          1,
-		Message:        message,
-		Reason:         "Scheduled",
-		LastTimestamp:  metav1.NewTime(timestamp),
-		FirstTimestamp: metav1.NewTime(timestamp),
-		Type:           "Normal",
-		Source: v1.EventSource{
-			Component: SCHEDULER_NAME + " scheduler",
-		},
-		InvolvedObject: v1.ObjectReference{
-			Kind:      "Pod",
-			Name:      pod.Name,
-			Namespace: pod.Namespace,
-			UID:       pod.UID,
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			GenerateName: pod.Name + "-",
-		},
-	})
+	s.connector.CreatePodEvent(pod.Namespace, pod.Name, message, "Failed to schedule", pod.UID, timestamp)
 }
 
 type SchedulerCounter struct {
@@ -507,10 +454,7 @@ func (s *Scheduler) schedule() {
 
 	nodesInfo := make([]string, 0)
 	for _, node := range s.nodes {
-		// debug
-		if node.Labels["worker"] == "active" {
-			nodesInfo = append(nodesInfo, node.String())
-		}
+		nodesInfo = append(nodesInfo, node.String())
 	}
 
 	klog.Infof("start scheduling %v to %v",

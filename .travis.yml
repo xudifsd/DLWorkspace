@@ -91,6 +91,11 @@ matrix:
     after_success:
       - pip install python-coveralls
       - COVERALLS_PARALLEL=true coveralls --base_dir ../../../
+  - language: go
+    before_install:
+      - cd src/docker-images/scheduler/src
+    script:
+      - go test
 
 notifications:
   webhooks: https://coveralls.io/webhook
