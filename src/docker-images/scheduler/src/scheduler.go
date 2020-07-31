@@ -2,14 +2,16 @@ package main
 
 import (
 	"fmt"
-	"k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/klog"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/klog"
 )
 
 const SCHEDULER_NAME = "DLTS"
@@ -407,6 +409,7 @@ func (s *Scheduler) DeleteNode(name string) (returnedErr error) {
 }
 
 func (s *Scheduler) bindPodToNode(pod *PodInfo, node *NodeInfo) {
+	pod.NodeName = node.Name
 	s.connector.BindPodToNode(pod.Namespace, pod.Name, node.Name)
 
 	timestamp := time.Now().UTC()
@@ -433,6 +436,54 @@ func (c *SchedulerCounter) String() string {
 	return fmt.Sprintf("r:%d,s:%d,u:%d", c.ResourceNotEnought, c.SelectorNotMatch, c.Unschedulable)
 }
 
+type CachedNode struct {
+	FreeResource *Resource
+	Node         *NodeInfo
+}
+
+func newCachedNode(node *NodeInfo) *CachedNode {
+	return &CachedNode{
+		FreeResource: node.GetFreeResource(),
+		Node:         node,
+	}
+}
+
+func (c *CachedNode) Use(key string, used *Resource) {
+	c.FreeResource.Sub(used)
+	c.Node.Use(key, used)
+}
+
+func (c *CachedNode) String() string {
+	return fmt.Sprintf("%s{c:%d,g%d}", c.Node.String(), c.FreeResource.Cpu, c.FreeResource.Gpu)
+}
+
+func sortCachedNodes(target []*CachedNode) {
+	sort.SliceStable(target, func(i, j int) bool {
+		ii := target[i].FreeResource
+		jj := target[j].FreeResource
+
+		if ii.Gpu < jj.Gpu {
+			return true
+		} else if ii.Gpu > jj.Gpu {
+			return false
+		} else {
+			if ii.Cpu < jj.Cpu {
+				return true
+			} else if ii.Cpu > jj.Cpu {
+				return false
+			} else {
+				if ii.Memory < jj.Memory {
+					return true
+				} else if ii.Memory > jj.Memory {
+					return false
+				} else {
+					return strings.Compare(target[i].Node.Name, target[j].Node.Name) <= 0
+				}
+			}
+		}
+	})
+}
+
 // whenever want to lock pods and nodes, should always lock pods first to avoid deadlock
 func (s *Scheduler) schedule() {
 	startTime := time.Now()
@@ -453,14 +504,20 @@ func (s *Scheduler) schedule() {
 	}
 
 	nodesInfo := make([]string, 0)
+
+	cachedNodes := make([]*CachedNode, 0)
 	for _, node := range s.nodes {
+		cachedNodes = append(cachedNodes, newCachedNode(node))
+	}
+	sortCachedNodes(cachedNodes)
+
+	nodesInfo = make([]string, 0)
+	for _, node := range cachedNodes {
 		nodesInfo = append(nodesInfo, node.String())
 	}
 
 	klog.Infof("start scheduling %v to %v",
 		strings.Join(podsInfo, "|"), strings.Join(nodesInfo, "|"))
-
-	// scheduling
 
 	for _, pod := range s.pods {
 		if pod.NodeName != "" || pod.SchedulerName != SCHEDULER_NAME {
@@ -469,29 +526,26 @@ func (s *Scheduler) schedule() {
 		scheduled := false
 		schedulerCounter := &SchedulerCounter{}
 
-		// TODO sort according to available resource to avoid fragmentation
-		for _, node := range s.nodes {
-			if node.Unschedulable {
+		for _, cached := range cachedNodes {
+			if cached.Node.Unschedulable {
 				schedulerCounter.Unschedulable += 1
 				continue
 			}
 
-			if !IsSelectorMatchs(node.Labels, pod.NodeSelector) {
+			if !IsSelectorMatchs(cached.Node.Labels, pod.NodeSelector) {
 				schedulerCounter.SelectorNotMatch += 1
 				continue
 			}
 
-			// TODO cache free
-			free := node.GetFreeResource()
-
-			if !free.CanSatisfy(&pod.RequiredResource) {
+			if !cached.FreeResource.CanSatisfy(&pod.RequiredResource) {
 				schedulerCounter.ResourceNotEnought += 1
 				continue
 			}
 
-			node.Use(pod.Key, &pod.RequiredResource)
+			cached.Use(pod.Key, &pod.RequiredResource)
+			sortCachedNodes(cachedNodes)
 
-			s.bindPodToNode(pod, node)
+			s.bindPodToNode(pod, cached.Node)
 			scheduled = true
 
 			break

@@ -2,12 +2,13 @@ package main
 
 import (
 	"fmt"
-	"k8s.io/api/core/v1"
+	"testing"
+	"time"
+
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"testing"
-	"time"
 )
 
 // Bindings is pod key to node name
@@ -49,6 +50,15 @@ func (c ConnectorForTest) assertBindTo(t *testing.T, key, nodeName string) {
 func (c ConnectorForTest) assertNotBound(t *testing.T, key string) {
 	if val, ok := c.Bindings[key]; ok {
 		t.Errorf("bind %s to %s, expect not bound", key, val)
+	}
+}
+
+func (c ConnectorForTest) getBindingNode(t *testing.T, key string) string {
+	if val, ok := c.Bindings[key]; ok {
+		return val
+	} else {
+		t.Errorf("failed to bind %s", key)
+		return ""
 	}
 }
 
@@ -175,4 +185,32 @@ func TestRespectUnschedulable(t *testing.T) {
 		newPod("default", "p1", make(map[string]string), "default", make(map[string]string), 1, 1, 1))
 	scheduler.schedule()
 	connector.assertNotBound(t, "default/p1")
+}
+
+func TestMinimizeGPUFragmentation(t *testing.T) {
+	connector := NewConnectorForTest()
+	scheduler := NewScheduler(connector)
+
+	for i := 0; i < 2; i++ {
+		nodeName := fmt.Sprintf("n%d", i)
+		scheduler.UpdateNode(nodeName, newNode(nodeName, make(map[string]string), 5, 5, 5, false))
+	}
+
+	scheduler.UpdatePod("default/pivot",
+		newPod("default", "pivot", make(map[string]string), SCHEDULER_NAME, make(map[string]string), 1, 1, 1))
+	scheduler.schedule()
+	pivotNode := connector.getBindingNode(t, "default/pivot")
+
+	for i := 0; i < 4; i++ {
+		podName := fmt.Sprintf("p%d", i)
+		key := fmt.Sprintf("default/%s", podName)
+		scheduler.UpdatePod(key,
+			newPod("default", podName, make(map[string]string), SCHEDULER_NAME, make(map[string]string), 1, 1, 1))
+	}
+	scheduler.schedule()
+
+	for i := 0; i < 4; i++ {
+		key := fmt.Sprintf("default/p%d", i)
+		connector.assertBindTo(t, key, pivotNode)
+	}
 }
